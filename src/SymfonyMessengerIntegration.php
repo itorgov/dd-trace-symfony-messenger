@@ -75,9 +75,9 @@ final class SymfonyMessengerIntegration
 
                     $ddTraceStamp = $envelope->last(DDTraceStamp::class);
                     if ($ddTraceStamp instanceof DDTraceStamp) {
-                        if (\dd_trace_env_config('DD_TRACE_LARAVEL_QUEUE_DISTRIBUTED_TRACING')) {
+                        if (\dd_trace_env_config('DD_TRACE_SYMFONY_MESSENGER_DISTRIBUTED_TRACING')) {
                             $newTrace = start_trace_span();
-                            $integration->setSpanAttributes($newTrace, 'symfony.messenger.handle_message', 'receive', $envelope);
+                            $integration->setSpanAttributes($newTrace, 'symfony.messenger.handle_message', $transportName, 'receive', $envelope);
 
                             consume_distributed_tracing_headers($ddTraceStamp->getHeaders());
 
@@ -107,7 +107,7 @@ final class SymfonyMessengerIntegration
                     }
 
                     $activeSpan = active_span();
-                    if (dd_trace_env_config('DD_TRACE_LARAVEL_QUEUE_DISTRIBUTED_TRACING')
+                    if (dd_trace_env_config('DD_TRACE_SYMFONY_MESSENGER_DISTRIBUTED_TRACING')
                         && $activeSpan !== $span
                         && $activeSpan === $newTrace) {
                         $integration->setSpanAttributes(
@@ -122,7 +122,7 @@ final class SymfonyMessengerIntegration
                         close_span();
 
                         if (
-                            dd_trace_env_config("DD_TRACE_REMOVE_ROOT_SPAN_LARAVEL_QUEUE")
+                            dd_trace_env_config("DD_TRACE_REMOVE_ROOT_SPAN_SYMFONY_MESSENGER")
                             && dd_trace_env_config("DD_TRACE_REMOVE_AUTOINSTRUMENTATION_ORPHANS")
                         ) {
                             set_distributed_tracing_context("0", "0");
@@ -145,7 +145,7 @@ final class SymfonyMessengerIntegration
         return 0;
     }
 
-    private function setSpanAttributes(
+    public function setSpanAttributes(
         SpanData $span,
         string $name,
         $transportName = null,
@@ -154,9 +154,10 @@ final class SymfonyMessengerIntegration
         $throwable = null
     ) {
         $span->name = $name;
-        $span->service = \dd_trace_env_config('DD_SERVICE') ?: 'symfony';
+        $service = \trim((string)\dd_trace_env_config('DD_SERVICE'));
+        $span->service = $service !== '' ? $service : 'symfony';
         $span->type = 'queue';
-        $this->setClientSpanComponent($span);
+        $this->setSpanKindAndComponent($span, $operation);
 
         if (\is_string($operation) && $operation !== '') {
             $this->setSpanTags($span, [Tag::MQ_OPERATION => $operation]);
@@ -194,7 +195,9 @@ final class SymfonyMessengerIntegration
         // AWS SQS
         if (\class_exists(AmazonSqsReceivedStamp::class)) {
             $amazonSqsReceivedStamp = $envelope->last(AmazonSqsReceivedStamp::class);
-            $transportMessageId = $amazonSqsReceivedStamp ? $amazonSqsReceivedStamp->getId() : null;
+            if ($amazonSqsReceivedStamp) {
+                $transportMessageId = $amazonSqsReceivedStamp->getId();
+            }
         }
 
         $stamps = [];
@@ -230,7 +233,7 @@ final class SymfonyMessengerIntegration
         $normalizedTags = $this->normalizeSpanTags($tags);
 
         // dd-trace-php 2 deprecates $meta in favour of $attributes and turns $meta into an object
-    // that array functions and operators reject
+        // that array functions and operators reject
         if (\property_exists($span, 'attributes')) {
             $span->attributes = $normalizedTags + $span->attributes;
 
@@ -241,8 +244,9 @@ final class SymfonyMessengerIntegration
     }
 
     /**
-     * Flattens nested arrays into dotted keys and casts the values to strings, as dd-trace-php 1 serializes $meta,
-     * so that dd-trace-php 2, which keeps nested arrays and numbers in $attributes, sends the same tags.
+     * Flattens nested arrays into dotted keys, as dd-trace-php 1 serializes $meta, so that dd-trace-php 2, which keeps
+     * nested arrays in $attributes, sends the same tags. Scalars keep their type, stringable objects are cast to
+     * strings and other objects are skipped.
      */
     private function normalizeSpanTags(array $tags, string $keyPrefix = ''): array
     {
@@ -259,24 +263,36 @@ final class SymfonyMessengerIntegration
                 continue;
             }
 
-            $normalizedTags[$keyPrefix . $key] = (string)$value;
+            if (\is_object($value)) {
+                if (!\method_exists($value, '__toString')) {
+                    continue;
+                }
+
+                $value = (string)$value;
+            }
+
+            $normalizedTags[$keyPrefix . $key] = $value;
         }
 
         return $normalizedTags;
     }
 
-    private function setClientSpanComponent(SpanData $span)
+    private function setSpanKindAndComponent(SpanData $span, $operation = null)
     {
         // dd-trace-php 2 sends span.kind and component written to $attributes as plain attributes,
-    // not as the span kind and component fields
+        // not as the span kind and component fields
         if (\property_exists($span, 'spanKind')) {
-            $span->spanKind = SpanKind::CLIENT;
+            $span->spanKind = $operation === 'receive'
+                ? SpanKind::CONSUMER
+                : ($operation === 'send' ? SpanKind::PRODUCER : SpanKind::CLIENT);
             $span->component = self::NAME;
 
             return;
         }
 
-        $span->meta[Tag::SPAN_KIND] = Tag::SPAN_KIND_VALUE_CLIENT;
+        $span->meta[Tag::SPAN_KIND] = $operation === 'receive'
+            ? Tag::SPAN_KIND_VALUE_CONSUMER
+            : ($operation === 'send' ? Tag::SPAN_KIND_VALUE_PRODUCER : Tag::SPAN_KIND_VALUE_CLIENT);
         $span->meta[Tag::COMPONENT] = self::NAME;
     }
 }

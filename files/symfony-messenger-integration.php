@@ -1,6 +1,8 @@
 <?php
 declare(strict_types=1);
 
+namespace NatePage\DDTrace\SymfonyMessenger;
+
 use DDTrace\HookData;
 use DDTrace\SpanData;
 use DDTrace\SpanKind;
@@ -73,9 +75,10 @@ function setSpanAttributes(
     }
 
     $span->resource = $resource;
-    $span->service = \dd_trace_env_config('DD_SERVICE') ?: 'symfony';
+    $service = \trim((string)\dd_trace_env_config('DD_SERVICE'));
+    $span->service = $service !== '' ? $service : 'symfony';
     $span->type = 'queue';
-    setClientSpanComponent($span, 'symfonymessenger');
+    setSpanKindAndComponent($span, 'symfonymessenger', $operation);
     setSpanTags($span, [
         'messaging.symfony.name' => $messageName, // Set name even for non-envelope messages
         Tag::MQ_OPERATION => $operation,
@@ -109,7 +112,9 @@ function resolveMetadataFromEnvelope(Envelope $envelope): array
     // AWS SQS
     if (\class_exists(AmazonSqsReceivedStamp::class)) {
         $amazonSqsReceivedStamp = $envelope->last(AmazonSqsReceivedStamp::class);
-        $transportMessageId = $amazonSqsReceivedStamp ? $amazonSqsReceivedStamp->getId() : null;
+        if ($amazonSqsReceivedStamp) {
+            $transportMessageId = $amazonSqsReceivedStamp->getId();
+        }
     }
 
     $stamps = [];
@@ -159,8 +164,9 @@ function setSpanTags(SpanData $span, array $tags)
 }
 
 /**
- * Flattens nested arrays into dotted keys and casts the values to strings, as dd-trace-php 1 serializes $meta,
- * so that dd-trace-php 2, which keeps nested arrays and numbers in $attributes, sends the same tags.
+ * Flattens nested arrays into dotted keys, as dd-trace-php 1 serializes $meta, so that dd-trace-php 2, which keeps
+ * nested arrays in $attributes, sends the same tags. Scalars keep their type, stringable objects are cast to strings
+ * and other objects are skipped.
  */
 function normalizeSpanTags(array $tags, string $keyPrefix = ''): array
 {
@@ -177,24 +183,36 @@ function normalizeSpanTags(array $tags, string $keyPrefix = ''): array
             continue;
         }
 
-        $normalizedTags[$keyPrefix . $key] = (string)$value;
+        if (\is_object($value)) {
+            if (!\method_exists($value, '__toString')) {
+                continue;
+            }
+
+            $value = (string)$value;
+        }
+
+        $normalizedTags[$keyPrefix . $key] = $value;
     }
 
     return $normalizedTags;
 }
 
-function setClientSpanComponent(SpanData $span, string $component)
+function setSpanKindAndComponent(SpanData $span, string $component, $operation = null)
 {
     // dd-trace-php 2 sends span.kind and component written to $attributes as plain attributes,
     // not as the span kind and component fields
     if (\property_exists($span, 'spanKind')) {
-        $span->spanKind = SpanKind::CLIENT;
+        $span->spanKind = $operation === 'receive'
+            ? SpanKind::CONSUMER
+            : ($operation === 'send' ? SpanKind::PRODUCER : SpanKind::CLIENT);
         $span->component = $component;
 
         return;
     }
 
-    $span->meta[Tag::SPAN_KIND] = Tag::SPAN_KIND_VALUE_CLIENT;
+    $span->meta[Tag::SPAN_KIND] = $operation === 'receive'
+        ? Tag::SPAN_KIND_VALUE_CONSUMER
+        : ($operation === 'send' ? Tag::SPAN_KIND_VALUE_PRODUCER : Tag::SPAN_KIND_VALUE_CLIENT);
     $span->meta[Tag::COMPONENT] = $component;
 }
 
@@ -277,7 +295,8 @@ trace_method(
                         $transportName,
                         $envelope,
                         null,
-                        true
+                        true,
+                        'receive'
                     );
 
                     consume_distributed_tracing_headers($ddTraceStamp->getHeaders());
@@ -316,7 +335,8 @@ trace_method(
                     $transportName,
                     $envelope,
                     $exception,
-                    true
+                    true,
+                    'receive'
                 );
 
                 close_span();
@@ -334,7 +354,8 @@ trace_method(
                 $transportName,
                 $envelope,
                 $exception,
-                true
+                true,
+                'receive'
             );
         },
         'recurse' => true,

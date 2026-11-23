@@ -5,6 +5,7 @@ namespace NatePage\DDTrace;
 
 use DDTrace\HookData;
 use DDTrace\SpanData;
+use DDTrace\SpanKind;
 use DDTrace\SpanLink;
 use DDTrace\Tag;
 use DDTrace\Util\ObjectKVStore;
@@ -41,7 +42,7 @@ final class SymfonyMessengerIntegration
                 /** @var \Symfony\Component\Messenger\Envelope $envelope */
                 $envelope = $hook->args[0];
 
-                if (\ddtrace_config_distributed_tracing_enabled()) {
+                if (\dd_trace_env_config('DD_DISTRIBUTED_TRACING')) {
                     $ddTraceStamp = $envelope->last(DDTraceStamp::class);
 
                     // Add distributed tracing stamp only if not already on the envelope
@@ -87,7 +88,7 @@ final class SymfonyMessengerIntegration
                         }
                     }
                 },
-                'posthook' => function (SpanData $span, array $args, $returnValue, \Throwable $exception = null) use ($integration, &$newTrace) {
+                'posthook' => function (SpanData $span, array $args, $returnValue, $exception = null) use ($integration, &$newTrace) {
                     /** @var \Symfony\Component\Messenger\Envelope $envelope */
                     $envelope = $args[0];
                     /** @var string $transportName */
@@ -153,13 +154,12 @@ final class SymfonyMessengerIntegration
         $throwable = null
     ) {
         $span->name = $name;
-        $span->service = \ddtrace_config_app_name('symfony');
+        $span->service = \dd_trace_env_config('DD_SERVICE') ?: 'symfony';
         $span->type = 'queue';
-        $span->meta[Tag::SPAN_KIND] = 'client';
-        $span->meta[Tag::COMPONENT] = self::NAME;
+        $this->setClientSpanComponent($span);
 
         if (\is_string($operation) && $operation !== '') {
-            $span->meta[Tag::MQ_OPERATION] = $operation;
+            $this->setSpanTags($span, [Tag::MQ_OPERATION => $operation]);
         }
 
         if ($envelope instanceof Envelope) {
@@ -171,7 +171,7 @@ final class SymfonyMessengerIntegration
                 ? \sprintf('%s -> %s', $messageName, $transportName)
                 : $messageName;
 
-            $span->meta = \array_merge($span->meta, $this->resolveMetadataFromEnvelope($envelope));
+            $this->setSpanTags($span, $this->resolveMetadataFromEnvelope($envelope));
         }
 
         if ($throwable instanceof \Throwable) {
@@ -223,5 +223,60 @@ final class SymfonyMessengerIntegration
 
             return $value !== null && $value !== '';
         });
+    }
+
+    private function setSpanTags(SpanData $span, array $tags)
+    {
+        $normalizedTags = $this->normalizeSpanTags($tags);
+
+        // dd-trace-php 2 deprecates $meta in favour of $attributes and turns $meta into an object
+    // that array functions and operators reject
+        if (\property_exists($span, 'attributes')) {
+            $span->attributes = $normalizedTags + $span->attributes;
+
+            return;
+        }
+
+        $span->meta = $normalizedTags + $span->meta;
+    }
+
+    /**
+     * Flattens nested arrays into dotted keys and casts the values to strings, as dd-trace-php 1 serializes $meta,
+     * so that dd-trace-php 2, which keeps nested arrays and numbers in $attributes, sends the same tags.
+     */
+    private function normalizeSpanTags(array $tags, string $keyPrefix = ''): array
+    {
+        $normalizedTags = [];
+
+        foreach ($tags as $key => $value) {
+            if ($value === null) {
+                continue;
+            }
+
+            if (\is_array($value)) {
+                $normalizedTags = $this->normalizeSpanTags($value, $keyPrefix . $key . '.') + $normalizedTags;
+
+                continue;
+            }
+
+            $normalizedTags[$keyPrefix . $key] = (string)$value;
+        }
+
+        return $normalizedTags;
+    }
+
+    private function setClientSpanComponent(SpanData $span)
+    {
+        // dd-trace-php 2 sends span.kind and component written to $attributes as plain attributes,
+    // not as the span kind and component fields
+        if (\property_exists($span, 'spanKind')) {
+            $span->spanKind = SpanKind::CLIENT;
+            $span->component = self::NAME;
+
+            return;
+        }
+
+        $span->meta[Tag::SPAN_KIND] = Tag::SPAN_KIND_VALUE_CLIENT;
+        $span->meta[Tag::COMPONENT] = self::NAME;
     }
 }

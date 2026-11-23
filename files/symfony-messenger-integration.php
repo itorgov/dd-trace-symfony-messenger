@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 use DDTrace\HookData;
 use DDTrace\SpanData;
+use DDTrace\SpanKind;
 use DDTrace\SpanLink;
 use DDTrace\Tag;
 use DDTrace\Util\ObjectKVStore;
@@ -64,7 +65,7 @@ function setSpanAttributes(
             $resource = $handledStamp->getHandlerName();
         }
 
-        $span->meta = \array_merge($span->meta, resolveMetadataFromEnvelope($envelope));
+        setSpanTags($span, resolveMetadataFromEnvelope($envelope));
     }
 
     if ($span->name === null || $span->name === '') {
@@ -72,12 +73,13 @@ function setSpanAttributes(
     }
 
     $span->resource = $resource;
-    $span->service = \ddtrace_config_app_name('symfony');
+    $span->service = \dd_trace_env_config('DD_SERVICE') ?: 'symfony';
     $span->type = 'queue';
-    $span->meta['messaging.symfony.name'] = $messageName; // Set name even for non-envelope messages
-    $span->meta[Tag::SPAN_KIND] = 'client';
-    $span->meta[Tag::COMPONENT] = 'symfonymessenger';
-    $span->meta[Tag::MQ_OPERATION] = $operation;
+    setClientSpanComponent($span, 'symfonymessenger');
+    setSpanTags($span, [
+        'messaging.symfony.name' => $messageName, // Set name even for non-envelope messages
+        Tag::MQ_OPERATION => $operation,
+    ]);
 
     if (($useMessageAsResource ?? false) && $resource === null) {
         $span->resource = $transportName !== null && $transportName !== ''
@@ -141,6 +143,61 @@ function resolveMetadataFromEnvelope(Envelope $envelope): array
     });
 }
 
+function setSpanTags(SpanData $span, array $tags)
+{
+    $normalizedTags = normalizeSpanTags($tags);
+
+    // dd-trace-php 2 deprecates $meta in favour of $attributes and turns $meta into an object
+    // that array functions and operators reject
+    if (\property_exists($span, 'attributes')) {
+        $span->attributes = $normalizedTags + $span->attributes;
+
+        return;
+    }
+
+    $span->meta = $normalizedTags + $span->meta;
+}
+
+/**
+ * Flattens nested arrays into dotted keys and casts the values to strings, as dd-trace-php 1 serializes $meta,
+ * so that dd-trace-php 2, which keeps nested arrays and numbers in $attributes, sends the same tags.
+ */
+function normalizeSpanTags(array $tags, string $keyPrefix = ''): array
+{
+    $normalizedTags = [];
+
+    foreach ($tags as $key => $value) {
+        if ($value === null) {
+            continue;
+        }
+
+        if (\is_array($value)) {
+            $normalizedTags = normalizeSpanTags($value, $keyPrefix . $key . '.') + $normalizedTags;
+
+            continue;
+        }
+
+        $normalizedTags[$keyPrefix . $key] = (string)$value;
+    }
+
+    return $normalizedTags;
+}
+
+function setClientSpanComponent(SpanData $span, string $component)
+{
+    // dd-trace-php 2 sends span.kind and component written to $attributes as plain attributes,
+    // not as the span kind and component fields
+    if (\property_exists($span, 'spanKind')) {
+        $span->spanKind = SpanKind::CLIENT;
+        $span->component = $component;
+
+        return;
+    }
+
+    $span->meta[Tag::SPAN_KIND] = Tag::SPAN_KIND_VALUE_CLIENT;
+    $span->meta[Tag::COMPONENT] = $component;
+}
+
 /* ---- Tracing Functions ---- */
 trace_method(
     'Symfony\Component\Messenger\MessageBusInterface',
@@ -179,7 +236,7 @@ install_hook(
         /** @var \Symfony\Component\Messenger\Envelope $envelope */
         $envelope = $hook->args[0];
 
-        if (\ddtrace_config_distributed_tracing_enabled()) {
+        if (\dd_trace_env_config('DD_DISTRIBUTED_TRACING')) {
             $ddTraceStamp = $envelope->last(DDTraceStamp::class);
 
             // Add distributed tracing stamp only if not already on the envelope
